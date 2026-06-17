@@ -74,6 +74,14 @@ class ParamModel:
         """Total number of parameters: npoi + npou."""
         return self.npoi + self.npou
 
+    @property
+    def param_constraint_means(self):
+        return tf.zeros([self.nparams], dtype=self.indata.dtype)
+
+    @property
+    def param_constraint_weights(self):
+        return tf.zeros([self.nparams], dtype=self.indata.dtype)
+
     # class function to parse strings as given by the argparse input e.g. --paramModel <Model> <arg[0]> <args[1]> ...
     @classmethod
     def parse_args(cls, indata, *args, **kwargs):
@@ -149,6 +157,20 @@ class CompositeParamModel(ParamModel):
         self.is_linear = self.nparams == 0 or self.allowNegativeParam
 
         self.xparamdefault = tf.concat([m.xparamdefault for m in param_models], axis=0)
+        self._param_constraint_means = tf.concat(
+            [m.param_constraint_means for m in param_models], axis=0
+        )
+        self._param_constraint_weights = tf.concat(
+            [m.param_constraint_weights for m in param_models], axis=0
+        )
+
+    @property
+    def param_constraint_means(self):
+        return self._param_constraint_means
+
+    @property
+    def param_constraint_weights(self):
+        return self._param_constraint_weights
 
     def compute(self, param, full=False):
         start = 0
@@ -181,6 +203,8 @@ class Ones(ParamModel):
         self.npou = 0
         self.params = np.array([])
         self.xparamdefault = tf.zeros([0], dtype=self.indata.dtype)
+        self._param_constraint_means = tf.zeros([0], dtype=self.indata.dtype)
+        self._param_constraint_weights = tf.zeros([0], dtype=self.indata.dtype)
 
         self.allowNegativeParam = False
         self.is_linear = True

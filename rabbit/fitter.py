@@ -1657,7 +1657,22 @@ class Fitter:
             # normalization factor for normal distribution: log(1/sqrt(2*pi)) = -0.9189385332046727
             lc = lc + 0.9189385332046727 * self.indata.constraintweights
 
-        return tf.reduce_sum(lc)
+        lc = tf.reduce_sum(lc)
+
+        if self.param_model.nparams:
+            model_params = self.x[: self.param_model.nparams]
+            model_constraint_weights = self.param_model.param_constraint_weights
+            model_constraint_means = self.param_model.param_constraint_means
+            lc_model = (
+                model_constraint_weights
+                * 0.5
+                * tf.square(model_params - model_constraint_means)
+            )
+            if full_nll:
+                lc_model = lc_model + 0.9189385332046727 * model_constraint_weights
+            lc = lc + tf.reduce_sum(lc_model)
+
+        return lc
 
     def _compute_lbeta(self, beta, full_nll=False):
         return self.bbstat.lbeta(beta, full_nll=full_nll)
