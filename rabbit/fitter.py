@@ -41,7 +41,7 @@ def match_regexp_params(regular_expressions, parameter_names):
 
 
 class FitterCallback:
-    def __init__(self, xv, early_stopping=-1):
+    def __init__(self, xv, early_stopping=-1, early_stopping_tol=0.0):
         self.iiter = 0
         self.xval = xv
 
@@ -51,6 +51,7 @@ class FitterCallback:
         self.t0 = time.time()
 
         self.early_stopping = early_stopping
+        self.early_stopping_tol = early_stopping_tol
 
     def __call__(self, intermediate_result):
         loss = intermediate_result.fun
@@ -62,7 +63,8 @@ class FitterCallback:
         if (
             self.early_stopping > 0
             and len(self.loss_history) > self.early_stopping
-            and self.loss_history[-self.early_stopping] <= loss
+            and self.loss_history[-self.early_stopping] - loss
+            <= self.early_stopping_tol
         ):
             raise ValueError(
                 f"No reduction in loss after {self.early_stopping} iterations, early stopping."
@@ -84,6 +86,7 @@ class Fitter:
         self.indata = indata
 
         self.earlyStopping = options.earlyStopping
+        self.earlyStoppingTol = getattr(options, "earlyStoppingTol", 0.0)
         self.globalImpactsFromJVP = globalImpactsFromJVP
 
         if self.indata.systematic_type not in Fitter.valid_systematic_types:
@@ -1946,7 +1949,7 @@ class Fitter:
 
         xval = self.x.numpy()
 
-        callback = FitterCallback(xval, self.earlyStopping)
+        callback = FitterCallback(xval, self.earlyStopping, self.earlyStoppingTol)
 
         if self.minimizer_method in [
             "trust-krylov",
