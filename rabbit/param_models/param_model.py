@@ -426,7 +426,7 @@ class AxisNormModel(ParamModel):
 
     Usage::
 
-        --paramModel AxisNormModel <channel> <proc_spec> <axes> (<poiOrPou>)
+        --paramModel AxisNormModel <channel> <proc_spec> <axes> (<poiOrPou>) (constraint:<sigma>) (exp)
 
     where proc_spec is ``all`` or a comma-separated list of process names,
     axes is a comma-separated list of axis names, and poiOrPou defaults to
@@ -439,10 +439,48 @@ class AxisNormModel(ParamModel):
 
     @classmethod
     def parse_args(cls, indata, *args, **kwargs):
+        args = list(args)
+        constraint_sigma = None
+        use_exp = False
+        constraint_args = [
+            i for i, arg in enumerate(args) if str(arg).startswith("constraint:")
+        ]
+        if len(constraint_args) > 1:
+            raise ValueError(
+                f"AxisNormModel accepts at most one constraint:<sigma> token, got {args}"
+            )
+        if constraint_args:
+            arg = args.pop(constraint_args[0])
+            parts = str(arg).split(":")
+            if len(parts) != 2:
+                raise ValueError(
+                    f"Invalid AxisNormModel constraint token '{arg}'. "
+                    "Expected constraint:<sigma>"
+                )
+            try:
+                constraint_sigma = float(parts[1])
+            except ValueError as exc:
+                raise ValueError(
+                    f"Invalid AxisNormModel constraint token '{arg}'. "
+                    "Constraint sigma must be a number."
+                ) from exc
+            if constraint_sigma <= 0:
+                raise ValueError(
+                    f"Invalid AxisNormModel constraint token '{arg}'. "
+                    "Constraint sigma must be positive."
+                )
+        exp_args = [i for i, arg in enumerate(args) if str(arg) == "exp"]
+        if len(exp_args) > 1:
+            raise ValueError(f"AxisNormModel accepts at most one exp token, got {args}")
+        if exp_args:
+            args.pop(exp_args[0])
+            use_exp = True
+
         if len(args) not in (3, 4):
             raise ValueError(
                 f"AxisNormModel requires exactly 3 or 4 positional arguments "
-                f"(channel, proc_spec, axes[, poiOrPou]) but got {len(args)}: {args}"
+                f"(channel, proc_spec, axes[, poiOrPou][, constraint:<sigma>][, exp]) "
+                f"but got {len(args)}: {args}"
             )
         channel, proc_spec, axes_csv = args[:3]
         if len(args) == 3:
@@ -451,7 +489,16 @@ class AxisNormModel(ParamModel):
             if args[3] not in ("poi", "pou"):
                 raise ValueError(f"poiOrPou must be poi or pou, but got {args[3]}")
             usePois = args[3] == "poi"
-        return cls(indata, channel, proc_spec, axes_csv, usePois=usePois, **kwargs)
+        return cls(
+            indata,
+            channel,
+            proc_spec,
+            axes_csv,
+            usePois=usePois,
+            constraint_sigma=constraint_sigma,
+            use_exp=use_exp,
+            **kwargs,
+        )
 
     def __init__(
         self,
@@ -460,6 +507,8 @@ class AxisNormModel(ParamModel):
         proc_spec,
         axes_csv,
         usePois=True,
+        constraint_sigma=None,
+        use_exp=False,
         expectSignal=None,
         allowNegativeParam=False,
         **kwargs,
@@ -557,12 +606,12 @@ class AxisNormModel(ParamModel):
             f"across {len(self.proc_idxs)} process(es)"
         )
 
-        # Enforce non-negativity via x^2 (commented out) or softplus (current) applied inside compute()
+        # Enforce non-negativity via x^2 or exp applied inside compute()
         # so this works correctly whether called standalone or inside a composite.
-        # allowNegativeParam=True tells the fitter/composite to pass raw x through;
-        # the squaring is handled here. Default raw = sqrt(1) = 1 so norm starts at 1 (same true for softplus).
+        # allowNegativeParam=True tells the fitter/composite to pass raw x through.
         self.allowNegativeParam = True
         self.is_linear = False
+        self.use_exp = use_exp
         paramdefault = np.ones(self.npoi + self.npou, dtype=np.float64)
         if expectSignal is not None:
             for signal, value in expectSignal:
@@ -571,13 +620,30 @@ class AxisNormModel(ParamModel):
                 if len(matches) == 0:
                     raise ValueError(f"{encoded} not in list of params: {self.params}")
                 paramdefault[matches[0]] = float(value)
-        # x^2
-        self.xparamdefault = tf.constant(np.sqrt(paramdefault), dtype=self.indata.dtype)
-        # softplus
-        _softplus_inv_1 = float(np.log(np.exp(1.0) - 1.0))
-        # self.xparamdefault = tf.constant(
-        #    _softplus_inv_1 * paramdefault, dtype=self.indata.dtype
-        # )
+        if self.use_exp:
+            raw_paramdefault = np.log(paramdefault)
+            print(f"AxisNormModel {channel}: using exp parameterization")
+        else:
+            raw_paramdefault = np.sqrt(paramdefault)
+        self.xparamdefault = tf.constant(raw_paramdefault, dtype=self.indata.dtype)
+        if constraint_sigma is None:
+            constraint_weights = np.zeros(self.npoi + self.npou, dtype=np.float64)
+        else:
+            constraint_weights = np.full(
+                self.npoi + self.npou,
+                1.0 / (constraint_sigma * constraint_sigma),
+                dtype=np.float64,
+            )
+            print(
+                f"AxisNormModel {channel}: Gaussian constraints with "
+                f"sigma(norm parameter)={constraint_sigma:g}"
+            )
+        self._param_constraint_means = tf.constant(
+            raw_paramdefault, dtype=self.indata.dtype
+        )
+        self._param_constraint_weights = tf.constant(
+            constraint_weights, dtype=self.indata.dtype
+        )
 
     def compute(self, param, full=False):
         reshape = [
@@ -602,10 +668,14 @@ class AxisNormModel(ParamModel):
                     ipoiu = param[start : start + n_cell]
                     start += n_cell
                     # x^2
+                    if self.use_exp:
+                        updates = tf.exp(ipoiu)
+                    else:
+                        updates = tf.square(ipoiu)
                     cell_scaling = tf.tensor_scatter_nd_update(
                         tf.ones(self.cell_shape, dtype=self.indata.dtype),
                         cells,
-                        tf.square(ipoiu),
+                        updates,
                     )
                     scaling = tf.reshape(
                         tf.broadcast_to(tf.reshape(cell_scaling, reshape), shape_input),
@@ -626,7 +696,8 @@ class AxisNormModel(ParamModel):
     def compute_sparse(self, param):
         if not self.indata.sparse:
             return super().compute_sparse(param)
-        values = tf.square(tf.gather(param, self.sparse_param_indices))
+        raw_values = tf.gather(param, self.sparse_param_indices)
+        values = tf.exp(raw_values) if self.use_exp else tf.square(raw_values)
         return tf.where(
             self.sparse_entry_mask,
             values,
@@ -644,7 +715,7 @@ class AxisExpModel(ParamModel):
         rnorm = exp(lnAmpl_ijk + slope_ijk · x_m)
 
     where x_m is the normalized center of shape-axis bin m (range [0, 1]).
-    Both parameters are unconstrained reals (allowNegativeParam always True):
+    Both parameters are reals (allowNegativeParam always True):
       lnAmpl controls the per-cell log-amplitude (exp(lnAmpl) is the yield at x=0).
       slope < 0 gives a falling exponential, slope = 0 is flat, slope > 0 is rising.
     The flat-background case (slope = 0) is an interior point, so the Hessian is
@@ -652,7 +723,13 @@ class AxisExpModel(ParamModel):
 
     Usage::
 
-        --paramModel AxisExpModel <channel> <proc_spec> <shape_axis> <cell_axes> (<slope_axes>) (<poiOrPou>)
+        --paramModel AxisExpModel <channel> <proc_spec> <shape_axis> <cell_axes> (<slope_axes>) (<amplitude_axes>) (<poiOrPou>) (constraint:<lnAmpl_sigma>:<slope_sigma>)
+
+    The optional slope_axes list can use ``axis:ngroups`` entries to share
+    slopes across coarser contiguous groups of an existing cell axis, e.g.
+    ``eta1:12,eta2:12,pt2:2``.
+    The optional amplitude_axes list uses the same syntax to share amplitudes
+    across coarser contiguous groups. If omitted, amplitudes remain per-cell.
 
     Example::
 
@@ -663,13 +740,44 @@ class AxisExpModel(ParamModel):
 
     @classmethod
     def parse_args(cls, indata, *args, **kwargs):
-        if len(args) not in (4, 5, 6):
+        args = list(args)
+        constraint_sigmas = None
+        constraint_args = [
+            i for i, arg in enumerate(args) if str(arg).startswith("constraint:")
+        ]
+        if len(constraint_args) > 1:
             raise ValueError(
-                f"AxisExpModel requires 4, 5, or 6 positional arguments "
-                f"(channel, proc_spec, shape_axis, cell_axes[, slope_axes, poiOrPou]) "
+                f"AxisExpModel accepts at most one constraint:<lnAmpl_sigma>:<slope_sigma> token, got {args}"
+            )
+        if constraint_args:
+            arg = args.pop(constraint_args[0])
+            parts = str(arg).split(":")
+            if len(parts) != 3:
+                raise ValueError(
+                    f"Invalid AxisExpModel constraint token '{arg}'. "
+                    "Expected constraint:<lnAmpl_sigma>:<slope_sigma>"
+                )
+            try:
+                constraint_sigmas = (float(parts[1]), float(parts[2]))
+            except ValueError as exc:
+                raise ValueError(
+                    f"Invalid AxisExpModel constraint token '{arg}'. "
+                    "Constraint sigmas must be numbers."
+                ) from exc
+            if constraint_sigmas[0] <= 0 or constraint_sigmas[1] <= 0:
+                raise ValueError(
+                    f"Invalid AxisExpModel constraint token '{arg}'. "
+                    "Constraint sigmas must be positive."
+                )
+
+        if len(args) not in (4, 5, 6, 7):
+            raise ValueError(
+                f"AxisExpModel requires 4, 5, 6, or 7 positional arguments "
+                f"(channel, proc_spec, shape_axis, cell_axes[, slope_axes[, amplitude_axes], poiOrPou][, constraint:<lnAmpl_sigma>:<slope_sigma>]) "
                 f"but got {len(args)}: {args}"
             )
         channel, proc_spec, shape_axis, cell_axes_csv = args[:4]
+        amplitude_axes_csv = None
         if len(args) >= 5:
             if args[4] in ("poi", "pou"):
                 usePois = args[4] == "poi"
@@ -677,7 +785,7 @@ class AxisExpModel(ParamModel):
             elif len(args) == 5:
                 usePois = True
                 slope_axes_csv = args[4]
-            else:
+            elif len(args) == 6:
                 if args[5] not in ("poi", "pou"):
                     raise ValueError(
                         f"if passing 6 arguments to AxisExpModel, require one to be poi or pou, "
@@ -685,6 +793,15 @@ class AxisExpModel(ParamModel):
                     )
                 usePois = args[5] == "poi"
                 slope_axes_csv = args[4]
+            else:
+                if args[6] not in ("poi", "pou"):
+                    raise ValueError(
+                        f"if passing 7 arguments to AxisExpModel, require the last one to be poi or pou, "
+                        f"but got {args}"
+                    )
+                usePois = args[6] == "poi"
+                slope_axes_csv = args[4]
+                amplitude_axes_csv = args[5]
         else:
             usePois = True
             slope_axes_csv = None
@@ -695,7 +812,9 @@ class AxisExpModel(ParamModel):
             shape_axis,
             cell_axes_csv,
             slope_axes_csv=slope_axes_csv,
+            amplitude_axes_csv=amplitude_axes_csv,
             usePois=usePois,
+            constraint_sigmas=constraint_sigmas,
             **kwargs,
         )
 
@@ -707,7 +826,9 @@ class AxisExpModel(ParamModel):
         shape_axis,
         cell_axes_csv,
         slope_axes_csv=None,
+        amplitude_axes_csv=None,
         usePois=True,
+        constraint_sigmas=None,
         expectSignal=None,
         allowNegativeParam=False,
         **kwargs,
@@ -744,20 +865,83 @@ class AxisExpModel(ParamModel):
         self.cell_axes = [axis_by_name[n] for n in cell_names]
         self.shape_axis = shape_axis
 
-        # Slope axes: subset of cell axes; default = all cell axes (per-cell slopes)
-        if slope_axes_csv is None:
-            slope_names = cell_names
-        else:
-            slope_names = [n.strip() for n in slope_axes_csv.split(",")]
-            bad = [n for n in slope_names if n not in self.cell_axis_names]
-            if bad:
-                raise ValueError(
-                    f"Slope axes {bad} are not in cell_axes '{cell_axes_csv}'. "
-                    f"Slope axes must be a subset of cell axes."
+        def parse_grouped_axis_specs(specs_csv, label):
+            if specs_csv is None:
+                specs = [(name, None) for name in cell_names]
+                names = cell_names
+            else:
+                specs = []
+                for spec in specs_csv.split(","):
+                    spec = spec.strip()
+                    if ":" in spec:
+                        name, ngroups = spec.split(":", 1)
+                        name = name.strip()
+                        try:
+                            ngroups = int(ngroups)
+                        except ValueError as exc:
+                            raise ValueError(
+                                f"Invalid grouped {label} axis specification '{spec}'"
+                            ) from exc
+                        if ngroups <= 0:
+                            raise ValueError(
+                                f"Invalid grouped {label} axis specification '{spec}'"
+                            )
+                    else:
+                        name = spec
+                        ngroups = None
+                    specs.append((name, ngroups))
+                names = [name for name, _ in specs]
+                bad = [n for n in names if n not in self.cell_axis_names]
+                if bad:
+                    raise ValueError(
+                        f"{label.capitalize()} axes {bad} are not in cell_axes '{cell_axes_csv}'. "
+                        f"{label.capitalize()} axes must be a subset of cell axes."
+                    )
+            return specs, names
+
+        def make_group_indices(specs, label):
+            group_indices = []
+            shape = []
+            param_label_names = []
+            for name, ngroups in specs:
+                axis = axis_by_name[name]
+                if ngroups is None:
+                    groups = axis.size
+                else:
+                    groups = min(ngroups, axis.size)
+                group_index = np.zeros(axis.size, dtype=np.int32)
+                for igroup, original_bins in enumerate(
+                    np.array_split(np.arange(axis.size), groups)
+                ):
+                    group_index[original_bins] = igroup
+                group_indices.append(group_index)
+                shape.append(groups)
+                param_label_names.append(
+                    f"{name}{label}{groups}" if ngroups is not None else name
                 )
+            return group_indices, shape, param_label_names
+
+        # Slope axes: subset of cell axes; default = all cell axes (per-cell slopes)
+        slope_specs, slope_names = parse_grouped_axis_specs(slope_axes_csv, "slope")
         self.slope_axis_names = set(slope_names)
         self.slope_axes = [axis_by_name[n] for n in slope_names]
-        self.slope_shape = [a.size for a in self.slope_axes]
+        (
+            self.slope_group_indices,
+            self.slope_shape,
+            self.slope_param_label_names,
+        ) = make_group_indices(slope_specs, "Slope")
+
+        # Amplitude axes: subset of cell axes; default = all cell axes (per-cell amplitudes)
+        amplitude_specs, amplitude_names = parse_grouped_axis_specs(
+            amplitude_axes_csv, "amplitude"
+        )
+        self.amplitude_axis_names = set(amplitude_names)
+        self.amplitude_axes = [axis_by_name[n] for n in amplitude_names]
+        (
+            self.amplitude_group_indices,
+            self.amplitude_shape,
+            self.amplitude_param_label_names,
+        ) = make_group_indices(amplitude_specs, "Amplitude")
 
         if proc_spec == "all":
             target_encoded = list(indata.procs)
@@ -780,19 +964,91 @@ class AxisExpModel(ParamModel):
             _active_axis_cells(indata, channel, proc_idx, self.cell_axes)
             for proc_idx in self.proc_idxs
         ]
+        amplitude_positions = [cell_names.index(name) for name in amplitude_names]
         slope_positions = [cell_names.index(name) for name in slope_names]
+        self.active_amplitude_groups = [
+            (
+                np.unique(
+                    np.stack(
+                        [
+                            group_index[cells[:, position]]
+                            for position, group_index in zip(
+                                amplitude_positions, self.amplitude_group_indices
+                            )
+                        ],
+                        axis=1,
+                    ),
+                    axis=0,
+                ).astype(np.int32)
+                if len(cells)
+                else np.empty((0, len(amplitude_positions)), dtype=np.int32)
+            )
+            for cells in self.active_cells
+        ]
+        self.active_cell_amplitude_groups = [
+            (
+                np.stack(
+                    [
+                        group_index[cells[:, position]]
+                        for position, group_index in zip(
+                            amplitude_positions, self.amplitude_group_indices
+                        )
+                    ],
+                    axis=1,
+                ).astype(np.int32)
+                if len(cells)
+                else np.empty((0, len(amplitude_positions)), dtype=np.int32)
+            )
+            for cells in self.active_cells
+        ]
         self.active_slope_groups = [
             (
-                np.unique(cells[:, slope_positions], axis=0).astype(np.int32)
+                np.unique(
+                    np.stack(
+                        [
+                            group_index[cells[:, position]]
+                            for position, group_index in zip(
+                                slope_positions, self.slope_group_indices
+                            )
+                        ],
+                        axis=1,
+                    ),
+                    axis=0,
+                ).astype(np.int32)
+                if len(cells)
+                else np.empty((0, len(slope_positions)), dtype=np.int32)
+            )
+            for cells in self.active_cells
+        ]
+        self.active_cell_slope_groups = [
+            (
+                np.stack(
+                    [
+                        group_index[cells[:, position]]
+                        for position, group_index in zip(
+                            slope_positions, self.slope_group_indices
+                        )
+                    ],
+                    axis=1,
+                ).astype(np.int32)
                 if len(cells)
                 else np.empty((0, len(slope_positions)), dtype=np.int32)
             )
             for cells in self.active_cells
         ]
         self.n_cells = [len(cells) for cells in self.active_cells]
+        self.n_amplitude_groups = [
+            len(groups) for groups in self.active_amplitude_groups
+        ]
         self.n_slope_groups = [len(groups) for groups in self.active_slope_groups]
-        self.npoi = sum(self.n_cells) + sum(self.n_slope_groups) if usePois else 0
-        self.npou = sum(self.n_cells) + sum(self.n_slope_groups) if not usePois else 0
+        self.npoi = (
+            sum(self.n_amplitude_groups) + sum(self.n_slope_groups) if usePois else 0
+        )
+        self.npou = (
+            sum(self.n_amplitude_groups) + sum(self.n_slope_groups)
+            if not usePois
+            else 0
+        )
         if indata.sparse:
             sparse_size = len(indata.norm.values)
             self.sparse_amplitude_param_indices = np.full(
@@ -807,41 +1063,102 @@ class AxisExpModel(ParamModel):
 
         names = []
         start = 0
-        for proc_encoded, proc_idx, cells, slope_groups in zip(
-            target_encoded, self.proc_idxs, self.active_cells, self.active_slope_groups
+        self.active_cell_amplitude_param_indices = []
+        self.active_cell_slope_param_indices = []
+        for (
+            proc_encoded,
+            proc_idx,
+            cells,
+            amplitude_groups,
+            cell_amplitude_groups,
+            slope_groups,
+            cell_slope_groups,
+        ) in zip(
+            target_encoded,
+            self.proc_idxs,
+            self.active_cells,
+            self.active_amplitude_groups,
+            self.active_cell_amplitude_groups,
+            self.active_slope_groups,
+            self.active_cell_slope_groups,
         ):
             proc_name = (
                 proc_encoded.decode()
                 if isinstance(proc_encoded, bytes)
                 else str(proc_encoded)
             )
-            cell_to_param = {}
-            for idxs in cells:
-                label = "_".join(f"{a.name}{i}" for a, i in zip(self.cell_axes, idxs))
+            amplitude_to_param = {}
+            amplitude_start = start
+            for idxs in amplitude_groups:
+                label = "_".join(
+                    f"{name}{i}"
+                    for name, i in zip(self.amplitude_param_label_names, idxs)
+                )
                 names.append(f"lnAmpl_{proc_name}_{label}".encode())
-                cell_to_param[tuple(idxs)] = start
+                amplitude_to_param[tuple(idxs)] = start
                 start += 1
+            self.active_cell_amplitude_param_indices.append(
+                np.array(
+                    [
+                        amplitude_to_param[tuple(idxs)] - amplitude_start
+                        for idxs in cell_amplitude_groups
+                    ],
+                    dtype=np.int32,
+                )
+            )
             slope_to_param = {}
+            slope_start = start
             for idxs in slope_groups:
-                label = "_".join(f"{a.name}{i}" for a, i in zip(self.slope_axes, idxs))
+                label = "_".join(
+                    f"{name}{i}"
+                    for name, i in zip(self.slope_param_label_names, idxs)
+                )
                 names.append(f"slope_{proc_name}_{label}".encode())
                 slope_to_param[tuple(idxs)] = start
                 start += 1
+            self.active_cell_slope_param_indices.append(
+                np.array(
+                    [
+                        slope_to_param[tuple(idxs)] - slope_start
+                        for idxs in cell_slope_groups
+                    ],
+                    dtype=np.int32,
+                )
+            )
             if indata.sparse:
                 positions, coords = _sparse_channel_entries(indata, channel, proc_idx)
                 channel_axis_names = [a.name for a in channel_axes]
                 cell_positions = [
                     channel_axis_names.index(a.name) for a in self.cell_axes
                 ]
+                amplitude_positions = [
+                    channel_axis_names.index(a.name) for a in self.amplitude_axes
+                ]
                 slope_positions = [
                     channel_axis_names.index(a.name) for a in self.slope_axes
                 ]
                 shape_position = channel_axis_names.index(shape_axis)
                 self.sparse_amplitude_param_indices[positions] = [
-                    cell_to_param[tuple(coord[cell_positions])] for coord in coords
+                    amplitude_to_param[
+                        tuple(
+                            group_index[coord[position]]
+                            for position, group_index in zip(
+                                amplitude_positions, self.amplitude_group_indices
+                            )
+                        )
+                    ]
+                    for coord in coords
                 ]
                 self.sparse_slope_param_indices[positions] = [
-                    slope_to_param[tuple(coord[slope_positions])] for coord in coords
+                    slope_to_param[
+                        tuple(
+                            group_index[coord[position]]
+                            for position, group_index in zip(
+                                slope_positions, self.slope_group_indices
+                            )
+                        )
+                    ]
+                    for coord in coords
                 ]
                 self.sparse_shape_values[positions] = coords[:, shape_position]
         self.params = np.array(names)
@@ -868,7 +1185,7 @@ class AxisExpModel(ParamModel):
             self.sparse_entry_mask = tf.constant([], dtype=tf.bool)
             self.sparse_shape_values = tf.constant([], dtype=tf.int32)
         print(
-            f"AxisExpModel {channel}: {sum(self.n_cells)} active amplitudes and "
+            f"AxisExpModel {channel}: {sum(self.n_amplitude_groups)} active amplitudes and "
             f"{sum(self.n_slope_groups)} active slopes across "
             f"{len(self.proc_idxs)} process(es)"
         )
@@ -897,6 +1214,28 @@ class AxisExpModel(ParamModel):
         self.is_linear = False
         # Default: lnAmpl=0 → amplitude=1, slope=0 → flat shape.
         self.xparamdefault = tf.zeros([self.npoi + self.npou], dtype=indata.dtype)
+        constraint_weights = np.zeros(self.npoi + self.npou, dtype=np.float64)
+        if constraint_sigmas is not None:
+            ln_ampl_sigma, slope_sigma = constraint_sigmas
+            weights = {
+                "lnAmpl_": 1.0 / (ln_ampl_sigma * ln_ampl_sigma),
+                "slope_": 1.0 / (slope_sigma * slope_sigma),
+            }
+            for i, name in enumerate(self.params.astype(str)):
+                for prefix, weight in weights.items():
+                    if name.startswith(prefix):
+                        constraint_weights[i] = weight
+                        break
+            print(
+                f"AxisExpModel {channel}: Gaussian constraints with "
+                f"sigma(lnAmpl)={ln_ampl_sigma:g}, sigma(slope)={slope_sigma:g}"
+            )
+        self._param_constraint_means = tf.zeros(
+            [self.npoi + self.npou], dtype=indata.dtype
+        )
+        self._param_constraint_weights = tf.constant(
+            constraint_weights, dtype=indata.dtype
+        )
 
     def compute(self, param, full=False):
         x_reshaped = tf.reshape(self.x_m, self.shape_reshape)
@@ -911,29 +1250,39 @@ class AxisExpModel(ParamModel):
             )
             if k == self.channel:
                 start = 0
-                for proc_idx, cells, slope_groups, n_cell, n_slope in zip(
+                for (
+                    proc_idx,
+                    cells,
+                    cell_amplitude_param_indices,
+                    cell_slope_param_indices,
+                    n_amplitude,
+                    n_slope,
+                ) in zip(
                     self.proc_idxs,
                     self.active_cells,
-                    self.active_slope_groups,
-                    self.n_cells,
+                    self.active_cell_amplitude_param_indices,
+                    self.active_cell_slope_param_indices,
+                    self.n_amplitude_groups,
                     self.n_slope_groups,
                 ):
-                    a_poiu = param[start : start + n_cell]
-                    start += n_cell
+                    a_poiu = param[start : start + n_amplitude]
+                    start += n_amplitude
                     b_poiu = param[start : start + n_slope]
                     start += n_slope
+                    a_for_cells = tf.gather(a_poiu, cell_amplitude_param_indices)
                     a_cells = tf.tensor_scatter_nd_update(
                         tf.zeros(self.cell_shape, dtype=self.indata.dtype),
                         cells,
-                        a_poiu,
+                        a_for_cells,
                     )
+                    b_for_cells = tf.gather(b_poiu, cell_slope_param_indices)
                     b_cells = tf.tensor_scatter_nd_update(
-                        tf.zeros(self.slope_shape, dtype=self.indata.dtype),
-                        slope_groups,
-                        b_poiu,
+                        tf.zeros(self.cell_shape, dtype=self.indata.dtype),
+                        cells,
+                        b_for_cells,
                     )
                     a = tf.reshape(a_cells, self.cell_reshape)
-                    b = tf.reshape(b_cells, self.slope_cell_reshape)
+                    b = tf.reshape(b_cells, self.cell_reshape)
                     scaling = tf.reshape(
                         tf.broadcast_to(tf.exp(a + b * x_reshaped), self.full_shape),
                         [-1, 1],
