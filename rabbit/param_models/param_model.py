@@ -1309,6 +1309,394 @@ class AxisExpModel(ParamModel):
         )
 
 
+class AxisSignalBackgroundModel(ParamModel):
+    """
+    Per-cell signal/background mixture model.
+
+    This mirrors the low-mass binned fitter model
+
+        N_data(cell) * [(1 - f_bkg(cell)) * signal_shape(cell, mass)
+                        + f_bkg(cell) * exp_shape(cell, mass)]
+
+    by returning multiplicative factors for one signal and one background
+    process. The signal shape is the nominal signal template in each cell,
+    normalized to unit integral over the shape axis. The background shape is
+    an exponential normalized over the shape axis.
+
+    Usage::
+
+        --paramModel AxisSignalBackgroundModel <channel> <signal_proc> <background_proc> <shape_axis> <cell_axes> [constraint:<fbkg_sigma>:<slope_sigma>]
+
+    The parameters are model nuisances (npou): one bounded background fraction
+    and one bounded positive slope per active cell.
+    """
+
+    @classmethod
+    def parse_args(cls, indata, *args, **kwargs):
+        args = list(args)
+        constraint_sigmas = None
+        constraint_args = [
+            i for i, arg in enumerate(args) if str(arg).startswith("constraint:")
+        ]
+        if len(constraint_args) > 1:
+            raise ValueError(
+                "AxisSignalBackgroundModel accepts at most one "
+                f"constraint:<fbkg_sigma>:<slope_sigma> token, got {args}"
+            )
+        if constraint_args:
+            arg = args.pop(constraint_args[0])
+            parts = str(arg).split(":")
+            if len(parts) != 3:
+                raise ValueError(
+                    f"Invalid AxisSignalBackgroundModel constraint token '{arg}'. "
+                    "Expected constraint:<fbkg_sigma>:<slope_sigma>"
+                )
+            try:
+                constraint_sigmas = (float(parts[1]), float(parts[2]))
+            except ValueError as exc:
+                raise ValueError(
+                    f"Invalid AxisSignalBackgroundModel constraint token '{arg}'. "
+                    "Constraint sigmas must be numbers."
+                ) from exc
+            if constraint_sigmas[0] <= 0 or constraint_sigmas[1] <= 0:
+                raise ValueError(
+                    f"Invalid AxisSignalBackgroundModel constraint token '{arg}'. "
+                    "Constraint sigmas must be positive."
+                )
+
+        if len(args) != 5:
+            raise ValueError(
+                "AxisSignalBackgroundModel requires exactly 5 positional arguments "
+                "(channel, signal_proc, background_proc, shape_axis, cell_axes"
+                "[, constraint:<fbkg_sigma>:<slope_sigma>]) "
+                f"but got {len(args)}: {args}"
+            )
+        return cls(indata, *args, constraint_sigmas=constraint_sigmas, **kwargs)
+
+    def __init__(
+        self,
+        indata,
+        channel,
+        signal_proc,
+        background_proc,
+        shape_axis,
+        cell_axes_csv,
+        constraint_sigmas=None,
+        fbkg_default=0.05,
+        slope_default=1.0,
+        **kwargs,
+    ):
+        self.indata = indata
+        if channel not in indata.channel_info:
+            raise ValueError(
+                f"Channel '{channel}' not found in tensor. "
+                f"Available: {list(indata.channel_info.keys())}"
+            )
+        self.channel = channel
+        channel_info = indata.channel_info[channel]
+        self.channel_axes = channel_info["axes"]
+        axis_by_name = {a.name: a for a in self.channel_axes}
+
+        if shape_axis not in axis_by_name:
+            raise ValueError(
+                f"Shape axis '{shape_axis}' not found in channel '{channel}'. "
+                f"Available: {list(axis_by_name.keys())}"
+            )
+        self.shape_axis = shape_axis
+        self.shape_axis_index = [a.name for a in self.channel_axes].index(shape_axis)
+        self.shape_axis_size = axis_by_name[shape_axis].size
+
+        cell_names = [n.strip() for n in cell_axes_csv.split(",")]
+        for name in cell_names:
+            if name not in axis_by_name:
+                raise ValueError(
+                    f"Cell axis '{name}' not found in channel '{channel}'. "
+                    f"Available: {list(axis_by_name.keys())}"
+                )
+            if name == shape_axis:
+                raise ValueError(
+                    f"Axis '{name}' appears in both shape_axis and cell_axes."
+                )
+        self.cell_axis_names = set(cell_names)
+        self.cell_axes = [axis_by_name[n] for n in cell_names]
+        self.cell_shape = [a.size for a in self.cell_axes]
+
+        def proc_index(proc_name):
+            encoded = proc_name.encode() if isinstance(proc_name, str) else proc_name
+            if encoded not in indata.procs:
+                raise ValueError(
+                    f"Process '{proc_name}' not found in tensor. "
+                    f"Available: {[p.decode() if isinstance(p, bytes) else p for p in indata.procs]}"
+                )
+            return int(np.where(indata.procs == encoded)[0][0])
+
+        self.signal_proc_idx = proc_index(signal_proc)
+        self.background_proc_idx = proc_index(background_proc)
+        self.signal_proc_name = signal_proc
+        self.background_proc_name = background_proc
+
+        self.active_cells = _active_axis_cells(
+            indata, channel, self.signal_proc_idx, self.cell_axes
+        )
+        self.n_cell = len(self.active_cells)
+        self.npoi = 0
+        self.npou = 2 * self.n_cell
+
+        names = []
+        cell_to_param = {}
+        for i, idxs in enumerate(self.active_cells):
+            label = "_".join(f"{a.name}{j}" for a, j in zip(self.cell_axes, idxs))
+            names.append(f"fbkg_{background_proc}_{label}".encode())
+            cell_to_param[tuple(idxs)] = i
+        for idxs in self.active_cells:
+            label = "_".join(f"{a.name}{j}" for a, j in zip(self.cell_axes, idxs))
+            names.append(f"slope_{background_proc}_{label}".encode())
+        self.params = np.array(names)
+
+        fbkg_default = float(fbkg_default)
+        slope_default = float(slope_default)
+        if not 0.0 < fbkg_default < 1.0:
+            raise ValueError("fbkg_default must be in (0, 1)")
+        if not 0.0 < slope_default < 2.0:
+            raise ValueError("slope_default must be in (0, 2)")
+        fbkg_raw_default = np.log(fbkg_default / (1.0 - fbkg_default))
+        slope_raw_default = np.log(slope_default / (2.0 - slope_default))
+        self.xparamdefault = tf.constant(
+            np.concatenate(
+                [
+                    np.full(self.n_cell, fbkg_raw_default, dtype=np.float64),
+                    np.full(self.n_cell, slope_raw_default, dtype=np.float64),
+                ]
+            ),
+            dtype=indata.dtype,
+        )
+        self._param_constraint_means = self.xparamdefault
+        constraint_weights = np.zeros(self.nparams, dtype=np.float64)
+        if constraint_sigmas is not None:
+            fbkg_sigma, slope_sigma = constraint_sigmas
+            constraint_weights[: self.n_cell] = 1.0 / (fbkg_sigma * fbkg_sigma)
+            constraint_weights[self.n_cell :] = 1.0 / (slope_sigma * slope_sigma)
+            print(
+                f"AxisSignalBackgroundModel {channel}: Gaussian constraints with "
+                f"sigma(fbkg raw)={fbkg_sigma:g}, sigma(slope raw)={slope_sigma:g}"
+            )
+        self._param_constraint_weights = tf.constant(
+            constraint_weights, dtype=indata.dtype
+        )
+
+        self.allowNegativeParam = True
+        self.is_linear = False
+
+        full_shape = [a.size for a in self.channel_axes]
+        self.full_shape = full_shape
+        axis_names = [a.name for a in self.channel_axes]
+        self.cell_positions = [axis_names.index(a.name) for a in self.cell_axes]
+
+        start = channel_info["start"]
+        stop = channel_info["stop"]
+        channel_slice = slice(start, stop)
+        channel_shape = tuple(full_shape)
+
+        if indata.sparse:
+            positions, coords = _sparse_channel_entries(
+                indata, channel, self.signal_proc_idx
+            )
+            values = indata.norm.values.numpy()[positions]
+            sig_dense = np.zeros(channel_shape, dtype=np.float64)
+            sig_dense[tuple(coords.T)] = values
+
+            bkg_positions, bkg_coords = _sparse_channel_entries(
+                indata, channel, self.background_proc_idx
+            )
+            bkg_values = indata.norm.values.numpy()[bkg_positions]
+            bkg_dense = np.zeros(channel_shape, dtype=np.float64)
+            bkg_dense[tuple(bkg_coords.T)] = bkg_values
+        else:
+            sig_dense = (
+                indata.norm.numpy()[channel_slice, self.signal_proc_idx]
+                .reshape(channel_shape)
+                .astype(np.float64)
+            )
+            bkg_dense = (
+                indata.norm.numpy()[channel_slice, self.background_proc_idx]
+                .reshape(channel_shape)
+                .astype(np.float64)
+            )
+
+        data_dense = indata.data_obs.numpy()[channel_slice].reshape(channel_shape)
+        self.data_cell_total = tf.constant(
+            np.sum(data_dense, axis=self.shape_axis_index), dtype=indata.dtype
+        )
+        self.signal_cell_total = tf.constant(
+            np.sum(sig_dense, axis=self.shape_axis_index), dtype=indata.dtype
+        )
+        def full_cell_index(cell):
+            cell_by_axis = {
+                position: value for position, value in zip(self.cell_positions, cell)
+            }
+            return tuple(
+                slice(None) if i == self.shape_axis_index else cell_by_axis[i]
+                for i in range(len(self.channel_axes))
+            )
+
+        active_data_cell_total = np.array(
+            [np.sum(data_dense[full_cell_index(cell)]) for cell in self.active_cells],
+            dtype=np.float64,
+        )
+        active_signal_cell_total = np.array(
+            [np.sum(sig_dense[full_cell_index(cell)]) for cell in self.active_cells],
+            dtype=np.float64,
+        )
+        self.active_data_cell_total = tf.constant(
+            active_data_cell_total, dtype=indata.dtype
+        )
+        self.active_signal_cell_total_safe = tf.constant(
+            np.where(active_signal_cell_total > 0, active_signal_cell_total, 1.0),
+            dtype=indata.dtype,
+        )
+
+        self.background_nominal_dense = tf.constant(bkg_dense, dtype=indata.dtype)
+        self.signal_cell_total_safe = tf.where(
+            self.signal_cell_total > 0,
+            self.signal_cell_total,
+            tf.ones_like(self.signal_cell_total),
+        )
+
+        centers = np.asarray(axis_by_name[shape_axis].centers, dtype=np.float64)
+        widths = np.asarray(axis_by_name[shape_axis].widths, dtype=np.float64)
+        x = (centers - centers[0]) / max(float(centers[-1] - centers[0]), 1e-12)
+        self.shape_x = tf.constant(x, dtype=indata.dtype)
+        self.shape_widths = tf.constant(widths, dtype=indata.dtype)
+
+        if indata.sparse:
+            sparse_size = len(indata.norm.values)
+            self.sparse_param_indices = np.full(sparse_size, -1, dtype=np.int32)
+            self.sparse_shape_values = np.zeros(sparse_size, dtype=np.int32)
+            self.sparse_proc_codes = np.zeros(sparse_size, dtype=np.int32)
+            self.sparse_nominal_values = indata.norm.values.numpy().astype(np.float64)
+            for proc_idx, proc_code in [
+                (self.signal_proc_idx, 1),
+                (self.background_proc_idx, 2),
+            ]:
+                positions, coords = _sparse_channel_entries(indata, channel, proc_idx)
+                for position, coord in zip(positions, coords):
+                    cell = tuple(coord[self.cell_positions])
+                    iparam = cell_to_param.get(cell, -1)
+                    if iparam < 0:
+                        continue
+                    self.sparse_param_indices[position] = iparam
+                    self.sparse_shape_values[position] = coord[self.shape_axis_index]
+                    self.sparse_proc_codes[position] = proc_code
+            self.sparse_entry_mask = tf.constant(
+                self.sparse_param_indices >= 0, dtype=tf.bool
+            )
+            self.sparse_param_indices = tf.constant(
+                np.maximum(self.sparse_param_indices, 0), dtype=tf.int32
+            )
+            self.sparse_shape_values = tf.constant(
+                self.sparse_shape_values, dtype=tf.int32
+            )
+            self.sparse_proc_codes = tf.constant(self.sparse_proc_codes, dtype=tf.int32)
+            self.sparse_nominal_values = tf.constant(
+                self.sparse_nominal_values, dtype=indata.dtype
+            )
+        else:
+            self.sparse_entry_mask = tf.constant([], dtype=tf.bool)
+            self.sparse_param_indices = tf.constant([], dtype=tf.int32)
+            self.sparse_shape_values = tf.constant([], dtype=tf.int32)
+            self.sparse_proc_codes = tf.constant([], dtype=tf.int32)
+            self.sparse_nominal_values = tf.constant([], dtype=indata.dtype)
+
+        print(
+            f"AxisSignalBackgroundModel {channel}: {self.n_cell} active "
+            f"signal/background mixture cells"
+        )
+
+    def _fbkg_slope(self, param):
+        fbkg = tf.math.sigmoid(param[: self.n_cell])
+        slope = 2.0 * tf.math.sigmoid(param[self.n_cell :])
+        return fbkg, slope
+
+    def _background_mass_counts(self, fbkg, slope):
+        raw = tf.exp(-tf.reshape(slope, [-1, 1]) * tf.reshape(self.shape_x, [1, -1]))
+        norm = tf.reduce_sum(raw * tf.reshape(self.shape_widths, [1, -1]), axis=1)
+        pdf_counts = raw * tf.reshape(self.shape_widths, [1, -1]) / norm[:, None]
+        return tf.reshape(fbkg, [-1, 1]) * pdf_counts
+
+    def compute(self, param, full=False):
+        fbkg, slope = self._fbkg_slope(param)
+        bkg_counts = self._background_mass_counts(fbkg, slope)
+
+        data_cell = tf.tensor_scatter_nd_update(
+            tf.zeros(self.cell_shape, dtype=self.indata.dtype),
+            self.active_cells,
+            tf.gather(tf.reshape(self.data_cell_total, [-1]), tf.range(self.n_cell)),
+        )
+        sig_total = tf.tensor_scatter_nd_update(
+            tf.ones(self.cell_shape, dtype=self.indata.dtype),
+            self.active_cells,
+            tf.gather(tf.reshape(self.signal_cell_total_safe, [-1]), tf.range(self.n_cell)),
+        )
+        fbkg_cells = tf.tensor_scatter_nd_update(
+            tf.zeros(self.cell_shape, dtype=self.indata.dtype),
+            self.active_cells,
+            fbkg,
+        )
+        bkg_cells = tf.tensor_scatter_nd_update(
+            tf.zeros(self.cell_shape + [self.shape_axis_size], dtype=self.indata.dtype),
+            np.insert(self.active_cells, self.shape_axis_index, 0, axis=1)
+            if self.shape_axis_index <= len(self.cell_shape)
+            else self.active_cells,
+            tf.zeros([self.n_cell], dtype=self.indata.dtype),
+        )
+        # Dense mode is not used for the current low-mass sparse tensors.
+        # Fall back to sparse logic by constructing factors in a dense flat array.
+        raise NotImplementedError(
+            "AxisSignalBackgroundModel dense compute is not implemented; use sparse tensors"
+        )
+
+    def compute_sparse(self, param):
+        if not self.indata.sparse:
+            return super().compute_sparse(param)
+        fbkg, slope = self._fbkg_slope(param)
+        data_cell_flat = tf.gather(
+            self.active_data_cell_total, self.sparse_param_indices
+        )
+        signal_total_flat = tf.gather(
+            self.active_signal_cell_total_safe, self.sparse_param_indices
+        )
+        fbkg_flat = tf.gather(fbkg, self.sparse_param_indices)
+        slope_flat = tf.gather(slope, self.sparse_param_indices)
+
+        signal_scale = (1.0 - fbkg_flat) * data_cell_flat / signal_total_flat
+
+        x = tf.gather(self.shape_x, self.sparse_shape_values)
+        width = tf.gather(self.shape_widths, self.sparse_shape_values)
+        raw = tf.exp(-slope_flat * x)
+        raw_all = tf.exp(-tf.reshape(slope, [-1, 1]) * tf.reshape(self.shape_x, [1, -1]))
+        norm_all = tf.reduce_sum(
+            raw_all * tf.reshape(self.shape_widths, [1, -1]), axis=1
+        )
+        norm_flat = tf.gather(norm_all, self.sparse_param_indices)
+        bkg_counts = fbkg_flat * data_cell_flat * raw * width / norm_flat
+        bkg_scale = bkg_counts / tf.where(
+            self.sparse_nominal_values > 0,
+            self.sparse_nominal_values,
+            tf.ones_like(self.sparse_nominal_values),
+        )
+
+        values = tf.where(
+            self.sparse_proc_codes == 1,
+            signal_scale,
+            tf.where(self.sparse_proc_codes == 2, bkg_scale, tf.ones_like(bkg_scale)),
+        )
+        return tf.where(
+            self.sparse_entry_mask,
+            values,
+            tf.ones_like(self.indata.norm.values),
+        )
+
+
 class AxisBernsteinModel(ParamModel):
     """
     Per-(process, cell) first-order Bernstein background param model.
