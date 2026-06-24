@@ -1546,12 +1546,10 @@ class Fitter:
         res = tf.reshape(res, (-1, 1))
         ndf = tf.size(res) - ndf_reduction
 
-        if ndf_reduction > 0:
-            # covariance matrix is in general non invertible with ndf < n
-            # compute chi2 using pseudo inverse
-            chi_square_value = tf.transpose(res) @ tf.linalg.pinv(res_cov) @ res
-        else:
-            chi_square_value = tf.transpose(res) @ tf.linalg.solve(res_cov, res)
+        # The projection covariance can be singular after sparse/occupancy masks
+        # remove bins, even when there is no explicit ndf reduction. Use the
+        # Moore-Penrose pseudo-inverse for a well-defined chi2 in those cases.
+        chi_square_value = tf.transpose(res) @ tf.linalg.pinv(res_cov) @ res
 
         return tf.squeeze(chi_square_value), ndf
 
