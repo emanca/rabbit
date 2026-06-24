@@ -373,6 +373,8 @@ def save_hists(args, mappings, fitter, ws, prefit=True, profile=False):
                 toy_theta0 = tf.identity(fitter_saturated.theta0)
                 saved_regularizers = fitter_saturated.regularizers
                 saved_tau = float(fitter_saturated.tau.numpy())
+                nominal_nparams = fitter.param_model.nparams
+                nominal_x = tf.identity(fitter.x)
                 fitter_saturated.init_fit_parms(
                     composite_model,
                     args.setConstraintMinimum,
@@ -383,7 +385,15 @@ def save_hists(args, mappings, fitter, ws, prefit=True, profile=False):
                 fitter_saturated.regularizers = saved_regularizers
                 fitter_saturated.tau.assign(saved_tau)
 
-                fitter_saturated.xdefaultassign()
+                saturated_x = tf.concat(
+                    [
+                        nominal_x[:nominal_nparams],
+                        saturated_model.xparamdefault,
+                        nominal_x[nominal_nparams:],
+                    ],
+                    axis=0,
+                )
+                fitter_saturated.x.assign(saturated_x)
                 cb = fitter_saturated.minimize()
                 if not args.noHessian:
                     _, grad, hess = fitter_saturated.loss_val_grad_hess()
