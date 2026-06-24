@@ -76,11 +76,19 @@ class ParamModel:
 
     @property
     def param_constraint_means(self):
-        return tf.zeros([self.nparams], dtype=self.indata.dtype)
+        return getattr(
+            self,
+            "_param_constraint_means",
+            tf.zeros([self.nparams], dtype=self.indata.dtype),
+        )
 
     @property
     def param_constraint_weights(self):
-        return tf.zeros([self.nparams], dtype=self.indata.dtype)
+        return getattr(
+            self,
+            "_param_constraint_weights",
+            tf.zeros([self.nparams], dtype=self.indata.dtype),
+        )
 
     # class function to parse strings as given by the argparse input e.g. --paramModel <Model> <arg[0]> <args[1]> ...
     @classmethod
