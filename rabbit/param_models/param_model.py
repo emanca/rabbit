@@ -1570,9 +1570,73 @@ class AxisSignalBackgroundModel(ParamModel):
             tf.ones_like(self.signal_cell_total),
         )
 
-        centers = np.asarray(axis_by_name[shape_axis].centers, dtype=np.float64)
-        widths = np.asarray(axis_by_name[shape_axis].widths, dtype=np.float64)
-        x = (centers - centers[0]) / max(float(centers[-1] - centers[0]), 1e-12)
+        shape_axis_obj = axis_by_name[shape_axis]
+        shape_metadata = getattr(shape_axis_obj, "metadata", None)
+        if (
+            isinstance(shape_metadata, dict)
+            and "physical_centers_nd" in shape_metadata
+        ):
+            centers_nd = np.asarray(
+                shape_metadata["physical_centers_nd"], dtype=np.float64
+            )
+            widths_nd = np.asarray(
+                shape_metadata.get("physical_widths_nd", np.ones_like(centers_nd)),
+                dtype=np.float64,
+            )
+            if centers_nd.shape != tuple(channel_shape):
+                raise ValueError(
+                    f"Physical center tensor for shape axis '{shape_axis}' has shape "
+                    f"{centers_nd.shape}, expected {tuple(channel_shape)}"
+                )
+            if widths_nd.shape != tuple(channel_shape):
+                raise ValueError(
+                    f"Physical width tensor for shape axis '{shape_axis}' has shape "
+                    f"{widths_nd.shape}, expected {tuple(channel_shape)}"
+                )
+
+            active_centers = np.asarray(
+                [centers_nd[full_cell_index(cell)] for cell in self.active_cells],
+                dtype=np.float64,
+            )
+            active_widths = np.asarray(
+                [widths_nd[full_cell_index(cell)] for cell in self.active_cells],
+                dtype=np.float64,
+            )
+            span = np.maximum(active_centers[:, -1] - active_centers[:, 0], 1e-12)
+            x = (active_centers - active_centers[:, :1]) / span[:, None]
+            widths = active_widths
+            print(
+                f"AxisSignalBackgroundModel {channel}: using conditional physical "
+                f"centers from metadata for shape axis '{shape_axis}'"
+            )
+        elif (
+            isinstance(shape_metadata, dict)
+            and "physical_centers" in shape_metadata
+        ):
+            centers = np.asarray(shape_metadata["physical_centers"], dtype=np.float64)
+            widths = np.asarray(
+                shape_metadata.get("physical_widths", np.ones_like(centers)),
+                dtype=np.float64,
+            )
+            if len(centers) != self.shape_axis_size:
+                raise ValueError(
+                    f"Physical centers for shape axis '{shape_axis}' have length "
+                    f"{len(centers)}, expected {self.shape_axis_size}"
+                )
+            if len(widths) != self.shape_axis_size:
+                raise ValueError(
+                    f"Physical widths for shape axis '{shape_axis}' have length "
+                    f"{len(widths)}, expected {self.shape_axis_size}"
+                )
+            print(
+                f"AxisSignalBackgroundModel {channel}: using physical centers "
+                f"from metadata for shape axis '{shape_axis}'"
+            )
+            x = (centers - centers[0]) / max(float(centers[-1] - centers[0]), 1e-12)
+        else:
+            centers = np.asarray(shape_axis_obj.centers, dtype=np.float64)
+            widths = np.asarray(shape_axis_obj.widths, dtype=np.float64)
+            x = (centers - centers[0]) / max(float(centers[-1] - centers[0]), 1e-12)
         self.shape_x = tf.constant(x, dtype=indata.dtype)
         self.shape_widths = tf.constant(widths, dtype=indata.dtype)
 
@@ -1626,9 +1690,14 @@ class AxisSignalBackgroundModel(ParamModel):
         return fbkg, slope
 
     def _background_mass_counts(self, fbkg, slope):
-        raw = tf.exp(-tf.reshape(slope, [-1, 1]) * tf.reshape(self.shape_x, [1, -1]))
-        norm = tf.reduce_sum(raw * tf.reshape(self.shape_widths, [1, -1]), axis=1)
-        pdf_counts = raw * tf.reshape(self.shape_widths, [1, -1]) / norm[:, None]
+        shape_x = self.shape_x
+        shape_widths = self.shape_widths
+        if shape_x.shape.rank == 1:
+            shape_x = tf.reshape(shape_x, [1, -1])
+            shape_widths = tf.reshape(shape_widths, [1, -1])
+        raw = tf.exp(tf.reshape(-slope, [-1, 1]) * shape_x)
+        norm = tf.reduce_sum(raw * shape_widths, axis=1)
+        pdf_counts = raw * shape_widths / norm[:, None]
         return tf.reshape(fbkg, [-1, 1]) * pdf_counts
 
     def compute(self, param, full=False):
@@ -1678,13 +1747,27 @@ class AxisSignalBackgroundModel(ParamModel):
 
         signal_scale = (1.0 - fbkg_flat) * data_cell_flat / signal_total_flat
 
-        x = tf.gather(self.shape_x, self.sparse_shape_values)
-        width = tf.gather(self.shape_widths, self.sparse_shape_values)
+        if self.shape_x.shape.rank == 1:
+            x = tf.gather(self.shape_x, self.sparse_shape_values)
+            width = tf.gather(self.shape_widths, self.sparse_shape_values)
+            raw_all = tf.exp(
+                tf.reshape(-slope, [-1, 1]) * tf.reshape(self.shape_x, [1, -1])
+            )
+            norm_all = tf.reduce_sum(
+                raw_all * tf.reshape(self.shape_widths, [1, -1]), axis=1
+            )
+        else:
+            x = tf.gather_nd(
+                self.shape_x,
+                tf.stack([self.sparse_param_indices, self.sparse_shape_values], axis=1),
+            )
+            width = tf.gather_nd(
+                self.shape_widths,
+                tf.stack([self.sparse_param_indices, self.sparse_shape_values], axis=1),
+            )
+            raw_all = tf.exp(tf.reshape(-slope, [-1, 1]) * self.shape_x)
+            norm_all = tf.reduce_sum(raw_all * self.shape_widths, axis=1)
         raw = tf.exp(-slope_flat * x)
-        raw_all = tf.exp(-tf.reshape(slope, [-1, 1]) * tf.reshape(self.shape_x, [1, -1]))
-        norm_all = tf.reduce_sum(
-            raw_all * tf.reshape(self.shape_widths, [1, -1]), axis=1
-        )
         norm_flat = tf.gather(norm_all, self.sparse_param_indices)
         bkg_counts = fbkg_flat * data_cell_flat * raw * width / norm_flat
         bkg_scale = bkg_counts / tf.where(
