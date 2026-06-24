@@ -397,8 +397,15 @@ def save_hists(args, mappings, fitter, ws, prefit=True, profile=False):
                 cb = fitter_saturated.minimize()
                 if not args.noHessian:
                     _, grad, hess = fitter_saturated.loss_val_grad_hess()
-                    edmval, cov = fitter_saturated.edmval_cov(grad, hess)
-                    logger.info(f"edmval: {edmval}")
+                    try:
+                        edmval, cov = fitter_saturated.edmval_cov(grad, hess)
+                        logger.info(f"edmval: {edmval}")
+                    except ValueError as ex:
+                        logger.warning(
+                            "Could not compute saturated projection EDM/covariance; "
+                            f"continue with saturated likelihood test only. ({ex})"
+                        )
+                        edmval = None
                 else:
                     edmval = None
 
