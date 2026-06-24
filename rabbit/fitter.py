@@ -423,15 +423,15 @@ class Fitter:
 
         if cov_ext is not None:
             if self.cov is None:
-                raise RuntimeError(
+                logger.warning(
                     "load_fitresult: external covariance was provided but "
-                    "the fitter was constructed with --noHessian (no full "
-                    "covariance is allocated). Construct the fitter without "
-                    "--noHessian to load an external covariance."
+                    "the fitter was constructed with --noHessian, so only "
+                    "the common parameter values will be loaded."
                 )
-            covval = self.cov.numpy()
-            covval[np.ix_(idxs, idxs)] = cov_ext[np.ix_(idxs_ext, idxs_ext)]
-            self.cov.assign(tf.constant(covval))
+            else:
+                covval = self.cov.numpy()
+                covval[np.ix_(idxs, idxs)] = cov_ext[np.ix_(idxs_ext, idxs_ext)]
+                self.cov.assign(tf.constant(covval))
 
         if profile:
             self._profile_beta()
